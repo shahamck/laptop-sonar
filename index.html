@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Laptop Sonar</title>
+  <meta name="description" content="Wave at your laptop to control it. The speakers play an inaudible tone, the mic hears the Doppler echo off your hand. No camera. A B1T Studios tool.">
+  <meta name="theme-color" content="#0159fb">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;700;900&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="top">
+    <p class="brandline mono">// tools · ultrasonic gestures · v0.1</p>
+    <h1>WAVE<br>AT IT</h1>
+    <p class="lede">Your speakers play a tone too high to hear. Your mic listens to it bounce off your hand. Move towards the screen and the echo goes up in pitch; move away and it drops. That's enough to read gestures. No camera.</p>
+    <ol class="steps mono">
+      <li><span>01</span> built-in speakers + mic</li>
+      <li><span>02</span> start sonar, keep still</li>
+      <li><span>03</span> wave 5–15 cm above the keys</li>
+      <li><span>04</span> control the deck or your mac</li>
+    </ol>
+  </header>
+
+  <main class="grid">
+    <section class="panel" aria-labelledby="sonar-h">
+      <div class="panel-head mono">
+        <h2 id="sonar-h">01 / sonar</h2>
+        <span id="status" class="pill">off</span>
+      </div>
+
+      <div class="stage" id="stage">
+        <canvas id="fall" aria-label="Echo spectrum: left and right tones, newest at the top"></canvas>
+        <div class="flash mono" id="flash" aria-hidden="true"><b id="flashGlyph"></b><span id="flashLabel"></span></div>
+        <div class="hold mono" id="hold" hidden>hold still · listening to the room</div>
+        <div class="stage-empty" id="stageEmpty">
+          <pre class="ascii-art mono" aria-hidden="true">
+      )))    ✋    (((
+   ))))))         ((((((
+ ________________________
+ \  [][][][][][][][][]  /
+  \____________________/</pre>
+          <button id="startBtn" class="btn primary">Start sonar</button>
+          <p class="note" id="startNote">Asks for the microphone. Audio is analysed on this device and never recorded or sent anywhere.</p>
+          <button id="simBtn" class="btn small ghost">No mic? Simulate</button>
+        </div>
+      </div>
+      <div class="scale mono" aria-hidden="true">
+        <span>← away · <b>L</b> tone · toward →</span><span>← away · <b>R</b> tone · toward →</span>
+      </div>
+
+      <canvas id="meter" class="meter" aria-label="Motion level for each tone, with the trigger threshold"></canvas>
+
+      <div class="row">
+        <button id="stopBtn" class="btn small" disabled>Stop</button>
+        <button id="calBtn" class="btn small" disabled>Recalibrate</button>
+        <label class="toggle mono"><input type="checkbox" id="flipToggle"> flip L/R</label>
+      </div>
+      <div class="row sim" id="simBar" hidden>
+        <span class="mono sim-label">simulate:</span>
+      </div>
+
+      <p class="readout mono" id="readout">&gt; sonar off_</p>
+      <p class="note warn" id="warn"></p>
+    </section>
+
+    <section class="panel" aria-labelledby="g-h">
+      <div class="panel-head mono">
+        <h2 id="g-h">02 / gestures</h2>
+        <span id="gCount" class="pill">0 read</span>
+      </div>
+      <ul class="gestures" id="gestures"></ul>
+      <h3 class="mono sub-h">log</h3>
+      <ol class="log mono" id="log"><li class="empty-log">nothing yet. wave.</li></ol>
+    </section>
+
+    <section class="panel wide" aria-labelledby="deck-h">
+      <div class="panel-head mono">
+        <h2 id="deck-h">03 / try it</h2>
+        <span id="deckPos" class="pill">1 / 5</span>
+      </div>
+      <div class="deck" id="deck" tabindex="0" aria-roledescription="slide deck" aria-live="polite">
+        <div class="slide" id="slide"><pre class="mono" id="slideArt"></pre><p class="slide-title" id="slideTitle"></p></div>
+      </div>
+      <p class="note mono">swipe left = next · swipe right = back · push = zoom in · pull = zoom out · tap = invert</p>
+    </section>
+
+    <section class="panel" aria-labelledby="tune-h">
+      <div class="panel-head mono">
+        <h2 id="tune-h">04 / tune</h2>
+        <span class="pill" id="toneInfo">— kHz</span>
+      </div>
+      <label class="slider mono">tone <output id="baseOut"></output>
+        <input type="range" id="base" min="17000" max="20000" step="100">
+      </label>
+      <p class="note">Higher is harder to hear but some speakers fade above 19 kHz. If you can hear a whine, go higher. Dogs and cats can hear it.</p>
+      <label class="slider mono">volume <output id="volOut"></output>
+        <input type="range" id="vol" min="0.05" max="0.6" step="0.01">
+      </label>
+      <label class="slider mono">trigger <output id="thrOut"></output>
+        <input type="range" id="thr" min="10" max="300" step="1">
+      </label>
+      <label class="slider mono">swipe gap <output id="gapOut"></output>
+        <input type="range" id="gap" min="0.02" max="0.2" step="0.005">
+      </label>
+      <div class="row">
+        <label class="toggle mono left"><input type="checkbox" id="stereoToggle" checked> one tone per speaker (needed for swipes)</label>
+      </div>
+      <p class="note">Recalibrates by itself when you change the tone or volume. Set the trigger so the dashed line sits above the meter when you're still.</p>
+    </section>
+
+    <section class="panel" aria-labelledby="mac-h">
+      <div class="panel-head mono">
+        <h2 id="mac-h">05 / control your mac</h2>
+        <span id="bridgeStatus" class="pill">off</span>
+      </div>
+      <p>A browser tab can't press keys in other apps, so a tiny local helper does it. Start it in Terminal:</p>
+      <pre class="code mono">cd ~/website/laptop-sonar
+python3 bridge.py</pre>
+      <table class="map mono">
+        <tbody>
+          <tr><td>← swipe left</td><td>→ key (next slide)</td></tr>
+          <tr><td>→ swipe right</td><td>← key (previous)</td></tr>
+          <tr><td>● tap</td><td>space (play / pause)</td></tr>
+          <tr><td>↓ push</td><td>⌘ + (zoom in)</td></tr>
+          <tr><td>↑ pull</td><td>⌘ − (zoom out)</td></tr>
+        </tbody>
+      </table>
+      <div class="row">
+        <label class="toggle mono left"><input type="checkbox" id="bridgeToggle"> send gestures to the helper</label>
+      </div>
+      <p class="note">macOS asks you to allow Terminal under Privacy &amp; Security › Accessibility the first time. Keep this tab open; it keeps listening while you're in Keynote or a video.</p>
+    </section>
+  </main>
+
+  <footer class="foot-brand mono">
+    <span>b1t studios</span><span aria-hidden="true">01100010 01101001 01110100</span>
+  </footer>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>

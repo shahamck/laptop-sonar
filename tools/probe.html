@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sonar Probe</title>
+<style>
+  :root { --blue: #0159fb; --ink: #0b0b10; --muted: #646675; }
+  body { font: 14px/1.5 ui-monospace, Menlo, monospace; margin: 0 auto; padding: 16px; max-width: 900px; background: #fff; color: var(--ink); }
+  h1 { color: var(--blue); font: 900 40px/1 "Helvetica Neue", Arial, sans-serif; letter-spacing: -0.04em; }
+  button { font: 600 14px ui-monospace, monospace; padding: 10px 16px; border-radius: 999px; border: 1px solid var(--blue); background: var(--blue); color: #fff; cursor: pointer; margin: 0 8px 8px 0; }
+  button:disabled { opacity: .4; }
+  pre { background: #0b0b10; color: #9fb9ff; padding: 12px; border-radius: 8px; white-space: pre-wrap; }
+  #prompt { font: 900 34px/1.1 "Helvetica Neue", Arial, sans-serif; color: var(--blue); min-height: 1.2em; }
+</style>
+</head>
+<body>
+<h1>SONAR PROBE</h1>
+<p>Measures what this Mac's speakers and mic can do above 14 kHz, then records a guided gesture session.</p>
+<button id="probe">1. Probe speakers + mic</button>
+<button id="capture">2. Record gestures (60 s)</button>
+<div id="prompt"></div>
+<pre id="out">idle</pre>
+<script type="module">
+const $ = (id) => document.getElementById(id);
+const out = (s) => { $('out').textContent = s; };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+let ctx, analyser, stream, buf;
+
+async function setup(fft) {
+  if (!ctx) {
+    ctx = new AudioContext({ latencyHint: 'interactive' });
+    stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1 } });
+    analyser = ctx.createAnalyser();
+    analyser.smoothingTimeConstant = 0;
+    ctx.createMediaStreamSource(stream).connect(analyser);
+  }
+  await ctx.resume();
+  analyser.fftSize = fft;
+  buf = new Float32Array(analyser.frequencyBinCount);
+  const track = stream.getAudioTracks()[0];
+  return { label: track.label, settings: track.getSettings(), sampleRate: ctx.sampleRate, binHz: ctx.sampleRate / fft };
+}
+
+function tone(freq, channel, gain = 0.2) {   // channel: 0 left, 1 right, 2 both
+  const osc = ctx.createOscillator(); osc.frequency.value = freq;
+  const g = ctx.createGain(); g.gain.value = 0; g.gain.setTargetAtTime(gain, ctx.currentTime, 0.01);
+  const m = ctx.createChannelMerger(2);
+  osc.connect(g);
+  if (channel !== 1) g.connect(m, 0, 0);
+  if (channel !== 0) g.connect(m, 0, 1);
+  m.connect(ctx.destination); osc.start();
+  return () => { g.gain.setTargetAtTime(0, ctx.currentTime, 0.01); setTimeout(() => { osc.stop(); m.disconnect(); }, 80); };
+}
+
+async function averaged(ms) {
+  const acc = new Float64Array(buf.length); let n = 0;
+  const end = performance.now() + ms;
+  while (performance.now() < end) {
+    analyser.getFloatFrequencyData(buf);
+    for (let i = 0; i < buf.length; i++) acc[i] += 10 ** (buf[i] / 10);
+    n++; await sleep(20);
+  }
+  return Array.from(acc, (p) => 10 * Math.log10(p / n));
+}
+
+function levelAt(spec, freq, binHz) {
+  const c = Math.round(freq / binHz);
+  let peak = -Infinity; for (let k = -2; k <= 2; k++) peak = Math.max(peak, spec[c + k]);
+  const far = []; for (let k = 30; k <= 60; k++) far.push(spec[c - k], spec[c + k]);
+  far.sort((a, b) => a - b);
+  return { peak: +peak.toFixed(1), snr: +(peak - far[far.length >> 1]).toFixed(1) };
+}
+
+$('probe').onclick = async () => {
+  $('probe').disabled = true;
+  try {
+    const info = await setup(8192);
+    const res = { info, sweep: [], perSpeaker: {} };
+    out('measuring room noise…');
+    const quiet = await averaged(600);
+    for (let f = 14000; f <= 21500; f += 500) {
+      out(`sweep ${f} Hz…`);
+      const stop = tone(f, 2); await sleep(120);
+      const spec = await averaged(250); stop(); await sleep(90);
+      const l = levelAt(spec, f, info.binHz);
+      res.sweep.push({ f, ...l, quiet: +quiet[Math.round(f / info.binHz)].toFixed(1) });
+    }
+    for (const [name, f, ch] of [['L18.6', 18600, 0], ['R18.6', 18600, 1], ['L19.8', 19800, 0], ['R19.8', 19800, 1], ['L17.5', 17500, 0], ['R17.5', 17500, 1]]) {
+      out(`speaker ${name}…`);
+      const stop = tone(f, ch); await sleep(150);
+      const spec = await averaged(500); stop(); await sleep(120);
+      res.perSpeaker[name] = levelAt(spec, f, info.binHz);
+    }
+    // Stability of the carrier when still: frame-to-frame jitter in the bins next to it.
+    out('carrier stability…');
+    analyser.fftSize = 4096; buf = new Float32Array(analyser.frequencyBinCount);
+    const binHz = ctx.sampleRate / 4096;
+    const stop = tone(18600, 2); await sleep(200);
+    const c = Math.round(18600 / binHz), rows = [];
+    for (let i = 0; i < 60; i++) { analyser.getFloatFrequencyData(buf); rows.push(Array.from({ length: 41 }, (_, j) => buf[c - 20 + j])); await sleep(20); }
+    stop();
+    res.still = Array.from({ length: 41 }, (_, j) => {
+      const v = rows.map((r) => r[j]); const m = v.reduce((a, b) => a + b) / v.length;
+      return [j - 20, +m.toFixed(1), +Math.sqrt(v.reduce((a, b) => a + (b - m) ** 2, 0) / v.length).toFixed(2)];
+    });
+    window.probeResult = res;
+    out(JSON.stringify(res, null, 1));
+  } catch (e) { out('error: ' + e); }
+  $('probe').disabled = false;
+};
+
+// Guided capture: plays the app's two tones and stores the bins around each carrier.
+const STEPS = [
+  ['keep still', 6], ['push ×3 (towards screen)', 8], ['pull ×3 (away)', 8],
+  ['swipe left→right ×3', 9], ['swipe right→left ×3', 9], ['tap ×3 (quick jab)', 8], ['type on the keyboard', 6], ['done', 0],
+];
+$('capture').onclick = async () => {
+  $('capture').disabled = true;
+  const info = await setup(4096);
+  const binHz = info.binHz, W = 40;
+  const cL = Math.round(18600 / binHz), cR = Math.round(19800 / binHz);
+  const stops = [tone(18600, 0, 0.25), tone(19800, 1, 0.25)];
+  await sleep(400);
+  const frames = [], marks = [];
+  const t0 = performance.now();
+  let stepIdx = 0, stepEnd = 0;
+  for (const [label, secs] of STEPS) {
+    marks.push({ label, t: (performance.now() - t0) / 1000 });
+    $('prompt').textContent = label;
+    if (!secs) break;
+    for (let n = 3; n > 0 && label !== 'keep still'; n--) { $('prompt').textContent = `${label} in ${n}…`; await sleep(500); }
+    marks[marks.length - 1].t = (performance.now() - t0) / 1000;
+    $('prompt').textContent = label;
+    const end = performance.now() + secs * 1000;
+    while (performance.now() < end) {
+      analyser.getFloatFrequencyData(buf);
+      const row = new Int16Array(2 * (2 * W + 1));
+      for (let k = -W; k <= W; k++) { row[k + W] = Math.round(buf[cL + k] * 10); row[2 * W + 1 + k + W] = Math.round(buf[cR + k] * 10); }
+      frames.push({ t: +((performance.now() - t0) / 1000).toFixed(3), r: Array.from(row) });
+      out(`${label}\n${frames.length} frames`);
+      await sleep(20);
+    }
+  }
+  stops.forEach((s) => s());
+  window.capture = { info, W, marks, frames };
+  out(`captured ${frames.length} frames. window.capture ready.`);
+  $('capture').disabled = false;
+};
+</script>
+</body>
+</html>
