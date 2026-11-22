@@ -1,5 +1,6 @@
 // Offline check of the sonar pipeline against synthetic spectra: node tools/test-dsp.mjs
-import { Reader, Segmenter, classify } from '../dsp.js';
+// The real-recording check is tools/test-real.mjs.
+import { Reader, Recognizer } from '../dsp.js';
 import { SpectrumSynth, SIM_GESTURES } from '../synth.js';
 
 const tones = { L: 18600, R: 19800 };
@@ -16,22 +17,18 @@ for (const sampleRate of [44100, 48000]) {
   const cal = reader.calibrate(still);
   console.log(`\n${sampleRate} Hz  snr L ${cal.snr.L.toFixed(1)} dB  R ${cal.snr.R.toFixed(1)} dB  threshold ${cal.threshold}`);
 
-  const seg = new Segmenter({ threshold: cal.threshold });
-  // Quiet stretch: must not trigger.
+  const rec = new Recognizer({ threshold: cal.threshold });
   let falseHits = 0;
-  for (let i = 0; i < 250; i++, t += dt) if (seg.push(reader.read(synth.frame(t), t))) falseHits++;
+  for (let i = 0; i < 250; i++, t += dt) falseHits += rec.push(reader.read(synth.frame(t), t)).length;
   report(`no false triggers at rest (${falseHits})`, falseHits === 0);
 
   for (const name of SIM_GESTURES) {
     for (let rep = 0; rep < 3; rep++) {
       synth.play(name, t);
       const got = [];
-      for (let i = 0; i < 70; i++, t += dt) {
-        const out = seg.push(reader.read(synth.frame(t), t));
-        if (out) got.push(classify(out));
-      }
+      for (let i = 0; i < 150; i++, t += dt) got.push(...rec.push(reader.read(synth.frame(t), t)));
       const names = got.map((g) => g.name).join(',') || '(none)';
-      report(`${name.padEnd(11)} → ${names.padEnd(11)} ${got[0] ? JSON.stringify(got[0].stats) : ''}`,
+      report(`${name.padEnd(5)} → ${names.padEnd(10)} ${got[0] ? JSON.stringify(got[0].stats) : ''}`,
         got.length === 1 && got[0].name === name);
     }
   }

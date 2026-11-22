@@ -1,38 +1,41 @@
 // Laptop Sonar: tone out, mic in, Doppler read, gestures out.
-import { Reader, Segmenter, classify, GESTURES, SPAN, WIDTH, GUARD } from './dsp.js';
+import { Reader, Recognizer, GESTURES, SPAN, GUARD } from './dsp.js';
 import { SpectrumSynth, SIM_GESTURES } from './synth.js';
 
 const $ = (id) => document.getElementById(id);
 const FFT = 4096;
 const TICK_MS = 20;               // ~50 frames a second; timers keep running in audible tabs
-const SETTLE_S = 0.4;             // let the tone fade in before learning the room
+const SETTLE_S = 0.5;             // let the tone fade in before learning the room
 const CAL_S = 1.5;
-const TONE_GAP = 1200;            // Hz between the left and right tones
+const TONE_GAP = 1200;            // Hz between the two tones
 const HISTORY = 64;               // waterfall rows kept
+const SHOW = 24;                  // bins each side of a tone drawn in the waterfall
 const RAMP = ' .·:-=+*#%@';
 
 // ---------- settings ----------
-const DEFAULTS = { base: 18600, volume: 0.25, threshold: 30, swipeGap: 0.06, flip: false, stereo: true, bridge: false };
+const DEFAULTS = { base: 18600, volume: 0.25, threshold: 40, minStroke: 500, bridge: false };
 const BRIDGE_URL = 'http://127.0.0.1:8650';
 const settings = (() => {
-  try { return { ...DEFAULTS, ...JSON.parse(localStorage.getItem('sonar.settings') || '{}') }; }
-  catch { return { ...DEFAULTS }; }
+  try {
+    const saved = JSON.parse(localStorage.getItem('sonar.settings.v2') || '{}');
+    return { ...DEFAULTS, ...saved };
+  } catch { return { ...DEFAULTS }; }
 })();
-function save() { try { localStorage.setItem('sonar.settings', JSON.stringify(settings)); } catch {} }
+function save() { try { localStorage.setItem('sonar.settings.v2', JSON.stringify(settings)); } catch {} }
 
 // ---------- state ----------
-let audio = null;                 // { ctx, analyser, stream, oscL, oscR, gainL, gainR, merger }
+let audio = null;                 // { ctx, analyser, stream, osc: [], gains: [] }
 let synth = null;                 // set in simulate mode
 let buf = null;
 let reader = null;
-let seg = null;
+let rec = null;
 let mode = 'off';                 // off | settling | calibrating | live
 let phaseUntil = 0;
 let calSpectra = [];
 let timer = null;
 let lastFrame = null;
-const fall = [];                  // { L: Float32Array, R: Float32Array, raw: bool }
-const meterHist = [];             // { L, R } scores
+const fall = [];                  // { L: Float32Array, R: Float32Array }
+const meterHist = [];             // { up, down, valid }
 let total = 0;
 const counts = Object.fromEntries(Object.keys(GESTURES).map((k) => [k, 0]));
 
@@ -41,7 +44,7 @@ const now = () => (performance.now() - t0) / 1000;
 
 function tones() {
   const nyq = (audio?.ctx.sampleRate ?? 48000) / 2;
-  const L = Math.min(settings.base, nyq - TONE_GAP - 1200);
+  const L = Math.min(settings.base, nyq - TONE_GAP - 1500);
   return { L, R: L + TONE_GAP };
 }
 
@@ -61,7 +64,7 @@ async function start(simulate = false) {
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1 },
       });
-      audio = { ctx, stream };
+      audio = { ctx, stream, osc: [], gains: [] };
       const analyser = ctx.createAnalyser();
       analyser.fftSize = FFT;
       analyser.smoothingTimeConstant = 0;
@@ -85,31 +88,23 @@ async function start(simulate = false) {
   }
 }
 
+/** Both tones from both speakers: on a MacBook Air the right speaker alone reached the mic 20 dB weaker. */
 function buildTones() {
   const { ctx } = audio;
+  audio.osc.forEach((o) => { try { o.stop(); } catch {} o.disconnect(); });
+  audio.gains.forEach((g) => g.disconnect());
   const f = tones();
-  for (const k of ['oscL', 'oscR', 'merger']) audio[k]?.disconnect();
-  audio.oscL?.stop(); audio.oscR?.stop();
-  const merger = ctx.createChannelMerger(2);
-  const make = (freq) => {
+  audio.osc = []; audio.gains = [];
+  for (const freq of [f.L, f.R]) {
     const osc = ctx.createOscillator();
     osc.frequency.value = freq;
     const gain = ctx.createGain();
     gain.gain.value = 0;
     gain.gain.setTargetAtTime(settings.volume, ctx.currentTime, 0.08);   // fade in: no click
-    osc.connect(gain);
+    osc.connect(gain).connect(ctx.destination);
     osc.start();
-    return [osc, gain];
-  };
-  const [oscL, gainL] = make(f.L), [oscR, gainR] = make(f.R);
-  if (settings.stereo) {
-    gainL.connect(merger, 0, 0);
-    gainR.connect(merger, 0, 1);
-  } else {
-    for (const g of [gainL, gainR]) { g.connect(merger, 0, 0); g.connect(merger, 0, 1); }
+    audio.osc.push(osc); audio.gains.push(gain);
   }
-  merger.connect(ctx.destination);
-  Object.assign(audio, { oscL, oscR, gainL, gainR, merger });
 }
 
 function checkDevice(stream) {
@@ -142,7 +137,7 @@ function stop() {
 // ---------- calibration ----------
 function calibrate() {
   reader = new Reader({ binHz: (audio?.ctx.sampleRate ?? 48000) / FFT, tones: tones() });
-  seg = null;
+  rec = null;
   calSpectra = [];
   mode = 'settling';
   phaseUntil = now() + SETTLE_S;
@@ -154,21 +149,21 @@ function finishCalibration() {
   const cal = reader.calibrate(calSpectra);
   calSpectra = [];
   $('hold').hidden = true;
-  if (!cal.ok) { setWarn('Calibration failed. Try again.'); mode = 'off'; return; }
+  if (!cal.ok) { setWarn('Calibration failed. Try again.'); calibrate(); return; }
   settings.threshold = cal.threshold;
   save();
   syncControls();
-  seg = new Segmenter({ threshold: settings.threshold });
+  rec = new Recognizer({ threshold: settings.threshold, minStroke: settings.minStroke });
   mode = 'live';
-  const weak = Math.min(cal.snr.L, cal.snr.R);
-  if (weak < 20) {
-    const side = cal.snr.L < cal.snr.R ? 'left' : 'right';
-    setWarn(`The mic can barely hear the ${side} tone (${weak.toFixed(0)} dB). Turn the Mac's volume up, use the built-in speakers, or lower the tone. ${settings.stereo ? 'If only one side is weak, your speakers may be mono: turn off "one tone per speaker".' : ''}`);
+  const snr = Math.max(cal.snr.L, cal.snr.R);
+  if (snr < 25) {
+    setWarn(`The mic can barely hear the tones (${snr.toFixed(0)} dB). Turn the Mac's volume up, use the built-in speakers and mic, or lower the tone.`);
     setStatus('weak echo', 'warn');
   } else {
+    setWarn('');
     setStatus('listening', 'on');
   }
-  $('toneInfo').textContent = `${(reader.tones.L / 1000).toFixed(1)} · ${(reader.tones.R / 1000).toFixed(1)} kHz · snr ${weak.toFixed(0)} dB`;
+  $('toneInfo').textContent = `${(reader.tones.L / 1000).toFixed(1)} + ${(reader.tones.R / 1000).toFixed(1)} kHz · snr ${snr.toFixed(0)} dB`;
 }
 
 // ---------- per-frame work ----------
@@ -189,27 +184,23 @@ function tick() {
 
   const f = reader.read(db, t);
   lastFrame = f;
-  fall.unshift({ L: reader.excess.L.slice(), R: reader.excess.R.slice(), raw: false });
+  fall.unshift({ L: reader.excess.L.slice(), R: reader.excess.R.slice(), click: !f.valid });
   if (fall.length > HISTORY) fall.pop();
-  meterHist.push({ L: f.L.score, R: f.R.score });
+  meterHist.push({ up: f.up, down: f.down });
   if (meterHist.length > 240) meterHist.shift();
 
-  const out = seg.push(f);
-  if (out) {
-    const g = classify(out, { swipeGap: settings.swipeGap, flip: settings.flip });
-    if (g) onGesture(g);
-  }
+  for (const g of rec.push(f)) onGesture(g);
 }
 
 /** Before calibration there is no floor yet: show level relative to the carrier. */
 function pushRaw(db) {
   reader.locate(db);
   const row = (s) => {
-    const c = reader.center[s], top = db[c], out = new Float32Array(WIDTH);
-    for (let k = -SPAN; k <= SPAN; k++) out[k + SPAN] = Math.max(0, db[c + k] - (top - 80)) * 0.35;
+    const c = reader.center[s], top = db[c], out = new Float32Array(2 * SPAN + 1);
+    for (let k = -SPAN; k <= SPAN; k++) out[k + SPAN] = Math.abs(k) <= GUARD ? 0 : Math.max(0, db[c + k] - (top - 80)) * 0.3;
     return out;
   };
-  fall.unshift({ L: row('L'), R: row('R'), raw: true });
+  fall.unshift({ L: row('L'), R: row('R') });
   if (fall.length > HISTORY) fall.pop();
 }
 
@@ -246,7 +237,9 @@ function log(g) {
   const li = document.createElement('li');
   const time = new Date().toLocaleTimeString([], { hour12: false });
   const s = g.stats;
-  li.innerHTML = `<span>${time}</span><b>${g.glyph} ${g.label}</b><i>gap ${s.gap.toFixed(2)}s · bal ${s.balance.toFixed(2)} · lean ${s.lean >= 0 ? '+' : ''}${s.lean.toFixed(2)} · v ${s.peakVel.toFixed(2)} m/s</i>`;
+  const detail = g.name === 'wave' ? `${s.strokes} strokes`
+    : [s.vIn ? `in ${s.vIn.toFixed(2)} m/s` : '', s.vOut ? `out ${s.vOut.toFixed(2)} m/s` : ''].filter(Boolean).join(' · ');
+  li.innerHTML = `<span>${time}</span><b>${g.glyph} ${g.label}</b><i>${detail}</i>`;
   ol.prepend(li);
   while (ol.children.length > 8) ol.lastChild.remove();
 }
@@ -296,8 +289,8 @@ function drawFall() {
   const canvas = $('fall'), ctx = canvas.getContext('2d');
   const { w, h } = fit(canvas);
   const css = getComputedStyle(document.documentElement);
-  const blue = css.getPropertyValue('--blue').trim(), muted = css.getPropertyValue('--line').trim();
-  const gapCols = 3, cols = WIDTH * 2 + gapCols;
+  const blue = css.getPropertyValue('--blue').trim(), line = css.getPropertyValue('--line').trim();
+  const width = SHOW * 2 + 1, gapCols = 3, cols = width * 2 + gapCols;
   const cw = w / cols, fs = cw / 0.6;
   const lh = fs * 1.05, rows = Math.min(Math.floor(h / lh), fall.length);
   ctx.clearRect(0, 0, w, h);
@@ -307,20 +300,20 @@ function drawFall() {
     const row = fall[r];
     const fade = 1 - (r / Math.max(rows, 1)) * 0.75;
     ['L', 'R'].forEach((s, side) => {
-      const x0 = side * (WIDTH + gapCols) * cw;
+      const x0 = side * (width + gapCols) * cw;
       const vals = row[s];
-      for (let i = 0; i < WIDTH; i++) {
-        const k = i - SPAN;
+      for (let k = -SHOW; k <= SHOW; k++) {
         let ch, color = blue, alpha = fade;
-        if (Math.abs(k) <= GUARD) { ch = k === 0 ? '|' : ':'; color = muted; alpha = 1; }
+        if (Math.abs(k) <= GUARD) { ch = k === 0 ? '|' : ':'; color = line; alpha = 1; }
+        else if (row.click) { if (k % 6) continue; ch = '~'; color = line; alpha = 1; }
         else {
-          const lvl = Math.min(1, vals[i] / 24);
+          const lvl = Math.min(1, vals[k + SPAN] / 24);
           if (lvl <= 0.02) continue;
           ch = RAMP[Math.max(1, Math.round(lvl * (RAMP.length - 1)))];
         }
         ctx.globalAlpha = alpha;
         ctx.fillStyle = color;
-        ctx.fillText(ch, x0 + i * cw, r * lh);
+        ctx.fillText(ch, x0 + (k + SHOW) * cw, r * lh);
       }
     });
   }
@@ -331,51 +324,47 @@ function drawMeter() {
   const canvas = $('meter'), ctx = canvas.getContext('2d');
   const { w, h, dpr } = fit(canvas);
   const css = getComputedStyle(document.documentElement);
+  const ink = css.getPropertyValue('--ink').trim(), blue = css.getPropertyValue('--blue').trim(), muted = css.getPropertyValue('--muted').trim();
   ctx.clearRect(0, 0, w, h);
-  if (!seg) return;
+  if (!rec) return;
   const thr = settings.threshold;
   let peak = 0;
-  for (const m of meterHist) peak = Math.max(peak, m.L, m.R);
+  for (const m of meterHist) peak = Math.max(peak, m.up, m.down);
   const top = Math.max(thr * 2.5, peak * 1.1, 1);
   const y = (v) => h - Math.min(1, v / top) * (h - 6 * dpr) - 3 * dpr;
   const n = 240, dx = w / (n - 1), off = n - meterHist.length;
-  const line = (key, color) => {
+  const plot = (key, color) => {
     ctx.beginPath();
     meterHist.forEach((m, i) => { const X = (i + off) * dx, Y = y(m[key]); i ? ctx.lineTo(X, Y) : ctx.moveTo(X, Y); });
     ctx.strokeStyle = color; ctx.lineWidth = 1.5 * dpr; ctx.stroke();
   };
-  line('R', css.getPropertyValue('--ink').trim());
-  line('L', css.getPropertyValue('--blue').trim());
+  plot('down', ink);
+  plot('up', blue);
   ctx.setLineDash([5 * dpr, 4 * dpr]);
   ctx.beginPath(); ctx.moveTo(0, y(thr)); ctx.lineTo(w, y(thr));
-  ctx.strokeStyle = css.getPropertyValue('--muted').trim(); ctx.lineWidth = dpr; ctx.stroke();
+  ctx.strokeStyle = muted; ctx.lineWidth = dpr; ctx.stroke();
   ctx.setLineDash([]);
   ctx.font = `${10 * dpr}px "JetBrains Mono", monospace`;
-  ctx.fillStyle = css.getPropertyValue('--muted').trim();
-  ctx.fillText('L', 6 * dpr, 13 * dpr);
-  ctx.fillStyle = css.getPropertyValue('--blue').trim();
-  ctx.fillText('■', 16 * dpr, 13 * dpr);
-  ctx.fillStyle = css.getPropertyValue('--muted').trim();
-  ctx.fillText('R', 32 * dpr, 13 * dpr);
-  ctx.fillStyle = css.getPropertyValue('--ink').trim();
-  ctx.fillText('■', 42 * dpr, 13 * dpr);
+  ctx.fillStyle = blue; ctx.fillText('■ toward', 6 * dpr, 13 * dpr);
+  ctx.fillStyle = ink; ctx.fillText('■ away', 70 * dpr, 13 * dpr);
 }
 
 function readout() {
   const el = $('readout');
   if (mode !== 'live' || !lastFrame) { el.textContent = '> hold still · learning the room_'; return; }
   const f = lastFrame;
-  const v = f.score > settings.threshold * 0.5 ? f.vel : 0;
+  if (!f.valid) { el.innerHTML = '&gt; click or tap noise · ignored'; return; }
+  const v = f.score > settings.threshold ? f.vel : 0;
   const n = 10, x = Math.max(-1, Math.min(1, v / 1.2)), k = Math.round(Math.abs(x) * n);
   const left = x < 0 ? '░'.repeat(n - k) + '█'.repeat(k) : '░'.repeat(n);
   const right = x > 0 ? '█'.repeat(k) + '░'.repeat(n - k) : '░'.repeat(n);
   const sign = v >= 0 ? '+' : '−';
-  el.innerHTML = `&gt; away ${left}|${right} toward  <b>${sign}${Math.abs(v).toFixed(2)} m/s</b>  motion <b>${Math.round(f.score)}</b>/${settings.threshold}${seg?.capturing ? '  ● reading' : ''}`;
+  el.innerHTML = `&gt; away ${left}|${right} toward  <b>${sign}${Math.abs(v).toFixed(2)} m/s</b>  motion <b>${Math.round(f.score)}</b>/${settings.threshold}${rec?.active ? '  ● reading' : ''}`;
 }
 
 // ---------- demo deck ----------
 const SLIDES = [
-  { title: 'Wave to begin', art: String.raw`
+  { title: 'Push to begin', art: String.raw`
     _.-._
    | | | |_
    | | | | |
@@ -388,16 +377,15 @@ const SLIDES = [
   { title: 'Ultrasound, ~19 kHz', art: String.raw`
   speaker ))) ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ )))  hand
      mic  ((( ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ (((  echo
-          |<------------  5 – 15 cm  ---------->|` },
+          |<------------  5 – 30 cm  ---------->|` },
   { title: 'Doppler does the rest', art: String.raw`
   toward  ->  |  . : = # @ # = : .          pitch up
   still   ->  .  :  =  #|#  =  :  .          no shift
   away    ->     . : = # @ # = : . |         pitch down` },
-  { title: 'Two speakers, two tones', art: String.raw`
-   L 18.6 kHz                           R 19.8 kHz
-   [)))]  ---->  hand passes L, then R  ---->  [(((]
-       first echo here           second echo here
-            = swipe right   (reverse = swipe left)` },
+  { title: 'Push, pull, wave', art: String.raw`
+   push   fast in .............. slow out   = next
+   pull   slow in .............. fast out   = back
+   wave   in-out-in-out, quick              = invert` },
   { title: 'No camera. Just sound.', art: String.raw`
    01100010 01101001 01110100
        ______________________
@@ -406,7 +394,7 @@ const SLIDES = [
        \  [][][][][][][][]  /
         \__________________/` },
 ];
-let slideIdx = 0, zoom = 1;
+let slideIdx = 0;
 
 function renderSlide(dir = 0) {
   const s = $('slide');
@@ -414,22 +402,16 @@ function renderSlide(dir = 0) {
     $('slideArt').textContent = SLIDES[slideIdx].art.replace(/^\n/, '');
     $('slideTitle').textContent = SLIDES[slideIdx].title;
     $('deckPos').textContent = `${slideIdx + 1} / ${SLIDES.length}`;
-    s.style.setProperty('--z', zoom);
   };
   if (!dir) { apply(); return; }
   s.classList.add(dir > 0 ? 'out-left' : 'out-right');
-  setTimeout(() => {
-    apply();
-    s.classList.remove('out-left', 'out-right');
-  }, 180);
+  setTimeout(() => { apply(); s.classList.remove('out-left', 'out-right'); }, 180);
 }
 
 function deckGesture(name) {
-  if (name === 'swipe-left' && slideIdx < SLIDES.length - 1) { slideIdx++; renderSlide(1); }
-  else if (name === 'swipe-right' && slideIdx > 0) { slideIdx--; renderSlide(-1); }
-  else if (name === 'push') { zoom = Math.min(1.8, +(zoom + 0.2).toFixed(2)); renderSlide(); }
-  else if (name === 'pull') { zoom = Math.max(0.6, +(zoom - 0.2).toFixed(2)); renderSlide(); }
-  else if (name === 'tap') $('deck').classList.toggle('invert');
+  if (name === 'push') { slideIdx = (slideIdx + 1) % SLIDES.length; renderSlide(1); }
+  else if (name === 'pull') { slideIdx = (slideIdx - 1 + SLIDES.length) % SLIDES.length; renderSlide(-1); }
+  else if (name === 'wave') $('deck').classList.toggle('invert');
 }
 
 // ---------- mac bridge ----------
@@ -471,9 +453,7 @@ function syncControls() {
   $('base').value = settings.base; $('baseOut').textContent = `${(settings.base / 1000).toFixed(1)} kHz`;
   $('vol').value = settings.volume; $('volOut').textContent = `${Math.round(settings.volume * 100)}%`;
   $('thr').value = settings.threshold; $('thrOut').textContent = settings.threshold;
-  $('gap').value = settings.swipeGap; $('gapOut').textContent = `${Math.round(settings.swipeGap * 1000)} ms`;
-  $('flipToggle').checked = settings.flip;
-  $('stereoToggle').checked = settings.stereo;
+  $('stroke').value = settings.minStroke; $('strokeOut').textContent = settings.minStroke;
   $('bridgeToggle').checked = settings.bridge;
 }
 
@@ -497,25 +477,27 @@ function wire() {
   $('base').addEventListener('input', (e) => { settings.base = +e.target.value; save(); syncControls(); retune(); });
   $('vol').addEventListener('input', (e) => {
     settings.volume = +e.target.value; save(); syncControls();
-    if (audio) for (const g of [audio.gainL, audio.gainR]) g.gain.setTargetAtTime(settings.volume, audio.ctx.currentTime, 0.05);
+    if (audio) for (const g of audio.gains) g.gain.setTargetAtTime(settings.volume, audio.ctx.currentTime, 0.05);
     retune();
   });
   $('thr').addEventListener('input', (e) => {
     settings.threshold = +e.target.value; save(); syncControls();
-    if (seg) seg.threshold = settings.threshold;
+    if (rec) rec.rules.threshold = settings.threshold;
   });
-  $('gap').addEventListener('input', (e) => { settings.swipeGap = +e.target.value; save(); syncControls(); });
-  $('flipToggle').addEventListener('change', (e) => { settings.flip = e.target.checked; save(); });
-  $('stereoToggle').addEventListener('change', (e) => { settings.stereo = e.target.checked; save(); retune(); });
+  $('stroke').addEventListener('input', (e) => {
+    settings.minStroke = +e.target.value; save(); syncControls();
+    if (rec) rec.rules.minStroke = settings.minStroke;
+  });
   $('bridgeToggle').addEventListener('change', (e) => toggleBridge(e.target.checked));
 
-  // Keyboard: arrows drive the deck for comparison; 1–5 fire simulated gestures.
+  // Keyboard: arrows drive the deck for comparison; 1–3 fire simulated gestures.
   window.addEventListener('keydown', (e) => {
     if (e.target.closest('input')) return;
-    if (synth && /^[1-5]$/.test(e.key)) synth.play(SIM_GESTURES[+e.key - 1], now());
+    const n = +e.key;
+    if (synth && n >= 1 && n <= SIM_GESTURES.length) synth.play(SIM_GESTURES[n - 1], now());
     if (document.activeElement === $('deck')) {
-      if (e.key === 'ArrowRight') deckGesture('swipe-left');
-      if (e.key === 'ArrowLeft') deckGesture('swipe-right');
+      if (e.key === 'ArrowRight') deckGesture('push');
+      if (e.key === 'ArrowLeft') deckGesture('pull');
     }
   });
 

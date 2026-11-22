@@ -3,7 +3,7 @@
 
     python3 bridge.py            # listens on 127.0.0.1:8650
 
-Only accepts the five gesture names below and only from the origins in ALLOWED_ORIGINS,
+Only accepts the three gesture names below and only from the origins in ALLOWED_ORIGINS,
 and only presses the fixed keys in KEYS, so a web page can't make it run anything else.
 macOS asks to allow your terminal under Privacy & Security > Accessibility the first time.
 """
@@ -18,11 +18,9 @@ HOST, PORT = "127.0.0.1", 8650
 # Gesture -> (macOS key code, modifiers). Change these to remap.
 # Key codes: 123 left, 124 right, 125 down, 126 up, 49 space, 24 "=", 27 "-".
 KEYS = {
-    "swipe-left":  (124, []),               # right arrow: next slide
-    "swipe-right": (123, []),               # left arrow: previous slide
-    "tap":         (49,  []),               # space: play / pause
-    "push":        (24,  ["command"]),      # cmd + = : zoom in
-    "pull":        (27,  ["command"]),      # cmd + - : zoom out
+    "push": (124, []),      # right arrow: next slide
+    "pull": (123, []),      # left arrow: previous slide
+    "wave": (49,  []),      # space: play / pause
 }
 
 # Pages allowed to send gestures. Add your deployed URL here (scheme + host, no path).

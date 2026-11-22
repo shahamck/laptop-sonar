@@ -169,3 +169,4 @@ h2 { font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacin
 @media (prefers-reduced-motion: reduce) {
   .slide, .flash, .gest.hit { transition: none; animation: none; }
 }
+.note + .slider { margin-top: 14px; }

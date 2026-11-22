@@ -28,8 +28,8 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let ctx, analyser, stream, buf;
 
 async function setup(fft) {
-  if (!ctx) {
-    ctx = new AudioContext({ latencyHint: 'interactive' });
+  if (!analyser) {
+    ctx ??= new AudioContext({ latencyHint: 'interactive' });
     stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1 } });
     analyser = ctx.createAnalyser();
     analyser.smoothingTimeConstant = 0;

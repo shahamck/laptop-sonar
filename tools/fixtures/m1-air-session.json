@@ -1,0 +1,73 @@
+{
+ "about": "Real recording from a MacBook Air (M1), built-in speakers and mic, 18.6 kHz + 19.8 kHz tones from the left and right speaker. Only the \u00b140 FFT bins around each tone are kept (4096-point Blackman FFT at 48 kHz, 20 ms hop), as signed 8-bit dB. The recorder dropped ~8% of the audio, so there are clicks the pipeline has to reject. Taps are expected to read as pulls (the approach is too slow to see). Swipes are not scored: left/right direction isn't measurable with this mic layout.",
+ "sampleRate": 48000,
+ "fftSize": 4096,
+ "span": 40,
+ "tones": {
+  "L": 18600,
+  "R": 19800
+ },
+ "frames": 3963,
+ "t0": 0.0853,
+ "dt": 0.02,
+ "calibrate": [
+  7.23,
+  8.73
+ ],
+ "segments": [
+  {
+   "label": "still",
+   "start": 6.33,
+   "end": 12.83,
+   "expect": {}
+  },
+  {
+   "label": "push",
+   "start": 15.48,
+   "end": 22.9,
+   "expect": {
+    "push": 3
+   }
+  },
+  {
+   "label": "pull",
+   "start": 25.14,
+   "end": 32.56,
+   "expect": {
+    "pull": 3
+   }
+  },
+  {
+   "label": "swipe-right",
+   "start": 35.61,
+   "end": 44.41,
+   "expect": null
+  },
+  {
+   "label": "swipe-left",
+   "start": 47.64,
+   "end": 56.44,
+   "expect": null
+  },
+  {
+   "label": "tap",
+   "start": 58.34,
+   "end": 65.77,
+   "expect": {
+    "pull": 3
+   }
+  },
+  {
+   "label": "typing",
+   "start": 66.6,
+   "end": 73.11,
+   "expect": {}
+  },
+  {
+   "label": "still2",
+   "start": 73.64,
+   "end": 79.23,
+   "expect": {}
+  }
+ ]
+}
